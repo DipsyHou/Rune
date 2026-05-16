@@ -1,0 +1,7 @@
+.venv/
+.venv-win/
+.aios/local.md
+__pycache__/
+*.pyc
+*.egg-info/
+browser_error.log
