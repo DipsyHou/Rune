@@ -1,6 +1,6 @@
 .venv/
 .venv-win/
-.rune
+.rune/
 __pycache__/
 *.pyc
 *.egg-info/
