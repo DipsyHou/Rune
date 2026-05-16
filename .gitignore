@@ -1,6 +1,6 @@
 .venv/
 .venv-win/
-.aios/local.md
+.rune
 __pycache__/
 *.pyc
 *.egg-info/
