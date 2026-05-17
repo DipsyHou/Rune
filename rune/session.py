@@ -114,7 +114,13 @@ def load_conversation(path: Path) -> List[Dict[str, Any]]:
         event = record.get("event")
         data = record.get("data") or {}
         if event == "user_message":
-            conversation.append({"role": "user", "content": data.get("content", "")})
+            entry: Dict[str, Any] = {
+                "role": "user",
+                "content": data.get("content", ""),
+            }
+            if data.get("display") is not None:
+                entry["display"] = data.get("display")
+            conversation.append(entry)
         elif event == "assistant_message":
             conversation.append({"role": "assistant", "content": data.get("content", "")})
         elif event == "conversation_compacted":

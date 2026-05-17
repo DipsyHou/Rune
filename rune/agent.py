@@ -25,7 +25,6 @@ from rich.status import Status
 from rune.config import RuneConfig
 from rune.memory import MemoryStore
 from rune.registry import ToolRegistry
-from rune.reminder import ReminderStore
 from rune.security import SecurityManager
 from rune.session import SessionStore
 from rune.skills import SkillStore
@@ -78,19 +77,29 @@ class Agent:
 
     # ---- public API ----
 
-    def chat(self, user_input: str) -> str:
+    def chat(self, user_input: str, *, user_display: str | None = None) -> str:
         """
         Process one user turn.
 
         May trigger zero or more tool calls before returning the final
         assistant response as a string.
+
+        ``user_display`` is the raw REPL line shown to the user (e.g. before
+        @file expansion). When omitted, ``user_input`` is used for both.
         """
         # Sanitize & append user message to conversation memory
         user_input = _sanitize(user_input)
-        self.conversation.append({"role": "user", "content": user_input})
+        display = _sanitize(user_display) if user_display is not None else user_input
+        user_msg: Dict[str, Any] = {"role": "user", "content": user_input}
+        if user_display is not None:
+            user_msg["display"] = display
+        self.conversation.append(user_msg)
         self._emit({"type": "user", "content": user_input})
         if self.session_store:
-            self.session_store.append("user_message", {"content": user_input})
+            payload: Dict[str, Any] = {"content": user_input}
+            if user_display is not None:
+                payload["display"] = display
+            self.session_store.append("user_message", payload)
 
         self.maybe_compact_history()
 
@@ -270,14 +279,6 @@ class Agent:
         sys_info = f"{platform.system()} {platform.release()} ({platform.machine()})"
         hostname = platform.node()
 
-        # Reminder section — injected so the agent always "remembers"
-        reminder_section = ""
-        try:
-            store = ReminderStore()
-            reminder_section = store.get_system_prompt_section()
-        except Exception:
-            pass
-
         memory_section = ""
         try:
             memory_section = MemoryStore(cwd=cwd).get_system_prompt_section()
@@ -314,13 +315,10 @@ class Agent:
 4. 修改已有文件时优先使用 edit_file；创建新文件或用户明确要求完整覆盖时再使用 write_file。
 5. 长时间运行的服务、watcher、下载、构建任务优先使用 background_run_command，再用 background_status/background_output 检查。
 6. 如果可用 Skills 中有匹配任务的工作流，先调用 skill_read 读取完整 SKILL.md，再按其中步骤执行。
-7. 当用户要求「记住」长期偏好或事实时，使用 reminder_add；临时会话信息不要写入长期记忆。
-8. 对删除、覆盖、大范围移动、发送外部消息等高风险行为，先说明影响，并遵守权限确认结果。
-9. 工具失败时先读错误信息并尝试修复；不要重复执行同一个明显失败的操作。
-10. 默认用中文简洁回复，重点说明做了什么、结果如何、是否还有风险或下一步。
+7. 对删除、覆盖、大范围移动、发送外部消息等高风险行为，先说明影响，并遵守权限确认结果。
+8. 工具失败时先读错误信息并尝试修复；不要重复执行同一个明显失败的操作。
+9. 默认用中文简洁回复，重点说明做了什么、结果如何、是否还有风险或下一步。
 """
-        if reminder_section:
-            prompt += "\n" + reminder_section
         if memory_section:
             prompt += "\n\n" + memory_section
         if plugin_section:

@@ -40,8 +40,6 @@ class SecurityConfig:
 
     require_confirmation_for_red: bool = True
     require_confirmation_for_yellow: bool = False
-    # Whether the AI agent is allowed to add/edit/remove reminders
-    allow_ai_edit_reminders: bool = True
     # Ordered permission rules. Each rule:
     # {action: allow|deny|ask, tool: tool_name|*, contains: optional string}
     permission_rules: List[Dict[str, Any]] = field(default_factory=list)
@@ -157,7 +155,6 @@ class RuneConfig:
             "security": {
                 "require_confirmation_for_red": self.security.require_confirmation_for_red,
                 "require_confirmation_for_yellow": self.security.require_confirmation_for_yellow,
-                "allow_ai_edit_reminders": self.security.allow_ai_edit_reminders,
                 "permission_rules": self.security.permission_rules,
                 "blocked_commands": self.security.blocked_commands,
             },

@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+from pathlib import Path
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion, merge_completers
+from prompt_toolkit.filters import emacs_insert_mode, has_completions
+from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -19,7 +24,6 @@ from rune.agent import Agent
 from rune.config import RuneConfig
 from rune.memory import MemoryStore
 from rune.registry import ToolRegistry
-from rune.reminder import ReminderStore
 from rune.security import SecurityManager
 from rune.session import SessionStore, list_sessions, resume_session
 from rune.skills import SkillStore
@@ -45,12 +49,238 @@ HELP_TEXT = """\
   [cyan]/memory[/cyan]            查看/初始化分层记忆文件
   [cyan]/permissions[/cyan]       管理 allow/deny/ask 权限规则
   [cyan]/plugins[/cyan]           管理插件
-  [cyan]/reminder[/cyan]          管理备忘录
   [cyan]/skills[/cyan]            列出可用 Skills
   [cyan]/resume[/cyan]            按序号选择并恢复历史会话
   [cyan]/tools[/cyan]             列出所有已加载的工具
 
-[dim]任何不以 / 开头的输入都会发送给 AI 代理处理。[/dim]"""
+[dim]任何不以 / 开头的输入都会发送给 AI 代理处理。[/dim]
+[dim]输入 @文件路径 可引用本地文件，AI 会在本轮对话中阅读该文件内容。[/dim]"""
+
+BUILTIN_SLASH_COMMANDS = [
+    "/help",
+    "/clear",
+    "/compact",
+    "/config",
+    "/exit",
+    "/memory",
+    "/permissions",
+    "/plugins",
+    "/skills",
+    "/resume",
+    "/tools",
+]
+
+_AT_FILE_MAX_CHARS = 30_000
+_AT_REF_PATTERN = re.compile(r'@("([^"]+)"|\'([^\']+)\'|([^\s@]+))')
+
+
+class SlashCommandCompleter(Completer):
+    """Autocomplete built-in slash commands while typing."""
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if " " in text or not text.startswith("/"):
+            return
+        for command in BUILTIN_SLASH_COMMANDS:
+            if command.startswith(text):
+                yield Completion(command, start_position=-len(text))
+
+
+class AtFileCompleter(Completer):
+    """Autocomplete file paths after @."""
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        at = text.rfind("@")
+        if at < 0:
+            return
+
+        prefix = text[at + 1 :]
+        if " " in prefix:
+            return
+
+        for candidate in _complete_relative_paths(prefix):
+            yield Completion(candidate, start_position=-len(prefix))
+
+
+def _complete_relative_paths(partial: str) -> list[str]:
+    partial = partial.replace("\\", "/")
+    cwd = Path.cwd().resolve()
+
+    if "/" in partial:
+        dir_part, _, name_part = partial.rpartition("/")
+        root = (cwd / dir_part).resolve() if dir_part else cwd
+    else:
+        root = cwd
+        dir_part = ""
+        name_part = partial
+
+    if not root.is_dir():
+        root = cwd
+        dir_part = ""
+        name_part = partial
+
+    results: list[str] = []
+    parent = "../" if not dir_part else f"{dir_part}/../"
+    results.append(parent)
+
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: (not p.is_file(), p.name.lower()))
+    except OSError:
+        return results
+
+    for entry in entries:
+        if name_part and not entry.name.lower().startswith(name_part.lower()):
+            continue
+        if "/" in partial:
+            candidate = f"{dir_part}/{entry.name}".lstrip("/")
+        else:
+            try:
+                candidate = entry.relative_to(cwd).as_posix()
+            except ValueError:
+                candidate = entry.name
+        if entry.is_dir():
+            candidate = f"{candidate}/"
+        results.append(candidate)
+        if len(results) >= 40:
+            break
+    return results
+
+
+def _resolve_at_path(raw: str) -> Path:
+    path = Path(raw.strip("\"'")).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve()
+
+
+def _expand_file_mentions(text: str) -> str:
+    """Inject referenced file contents for @path mentions in user input."""
+    matches = list(_AT_REF_PATTERN.finditer(text))
+    if not matches:
+        return text
+
+    blocks: list[str] = []
+    for match in matches:
+        raw = match.group(2) or match.group(3) or match.group(4) or ""
+        path = _resolve_at_path(raw)
+        if not path.exists():
+            blocks.append(f"[引用文件不存在: {path}]")
+            continue
+        if path.is_dir():
+            blocks.append(f"[引用路径是目录: {path}]")
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            blocks.append(f"[无法读取文件 {path}: {exc}]")
+            continue
+
+        if len(content) > _AT_FILE_MAX_CHARS:
+            content = content[:_AT_FILE_MAX_CHARS] + "\n...(文件内容已截断)"
+
+        blocks.append(
+            "用户通过 @ 引用了文件，请仔细阅读以下内容：\n"
+            f"文件: {path}\n"
+            f"```\n{content}\n```"
+        )
+
+    return "\n\n".join(blocks) + "\n\n用户消息：\n" + text
+
+
+_USER_MESSAGE_MARKER = "\n\n用户消息：\n"
+
+
+def _user_display_text(msg: dict) -> str:
+    """Prefer stored display text; fall back to stripping @file injection blocks."""
+    display = msg.get("display")
+    if display is not None:
+        return str(display).strip()
+    content = str(msg.get("content", "")).strip()
+    if _USER_MESSAGE_MARKER in content:
+        return content.split(_USER_MESSAGE_MARKER, 1)[1].strip()
+    return content
+
+
+def _print_conversation_history(conversation: list[dict]) -> None:
+    """Replay user input and assistant replies in live-session order."""
+    shown = False
+    for msg in conversation:
+        role = msg.get("role")
+        if role == "system":
+            continue
+
+        if role == "user":
+            display = _user_display_text(msg)
+            if display:
+                console.print(f"[bold]You >[/bold] {display}")
+                shown = True
+            continue
+
+        if role != "assistant":
+            continue
+
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+        console.print()
+        console.print(Panel(content, title="🔮 Rune", border_style="cyan", padding=(0, 1)))
+        console.print()
+        shown = True
+
+    if not shown:
+        console.print("[dim]该会话没有可显示的历史消息。[/dim]\n")
+
+
+def _highlight_completion(buffer, index: int | None) -> None:
+    """Update menu highlight only; do not insert text into the input."""
+    state = buffer.complete_state
+    if not state or not state.completions:
+        return
+    state.go_to_index(index)
+    buffer.on_completions_changed.fire()
+
+
+def _build_prompt_key_bindings() -> KeyBindings:
+    """Arrows highlight completions; only Tab inserts the selected item."""
+    kb = KeyBindings()
+
+    @kb.add("tab", filter=emacs_insert_mode)
+    def tab_complete(event) -> None:
+        buffer = event.current_buffer
+        state = buffer.complete_state
+        if state and state.completions:
+            index = state.complete_index if state.complete_index is not None else 0
+            buffer.apply_completion(state.completions[index])
+            return
+        buffer.start_completion(select_first=False)
+
+    @kb.add("down", filter=has_completions & emacs_insert_mode)
+    def completion_down(event) -> None:
+        buffer = event.current_buffer
+        state = buffer.complete_state
+        if not state:
+            return
+        if state.complete_index is None:
+            _highlight_completion(buffer, 0)
+        elif state.complete_index < len(state.completions) - 1:
+            _highlight_completion(buffer, state.complete_index + 1)
+
+    @kb.add("up", filter=has_completions & emacs_insert_mode)
+    def completion_up(event) -> None:
+        buffer = event.current_buffer
+        state = buffer.complete_state
+        if not state:
+            return
+        if state.complete_index is None:
+            _highlight_completion(buffer, len(state.completions) - 1)
+        elif state.complete_index > 0:
+            _highlight_completion(buffer, state.complete_index - 1)
+        else:
+            _highlight_completion(buffer, None)
+
+    return kb
+
 
 # ---------------------------------------------------------------------------
 # Setup wizards
@@ -112,9 +342,6 @@ def _setup_security(config: RuneConfig) -> None:
 
     yellow = console.input("中危操作（执行命令、写文件等）需确认? (y/N): ").strip().lower()
     config.security.require_confirmation_for_yellow = yellow == "y"
-
-    ai_rem = console.input("允许 AI 编辑备忘录 (Reminders)? (Y/n): ").strip().lower()
-    config.security.allow_ai_edit_reminders = ai_rem != "n"
 
     config.save()
     console.print("[green]✅ 安全设置已保存。[/green]\n")
@@ -321,8 +548,9 @@ def _cmd_resume(agent: Agent, selection: str | None = None) -> SessionStore | No
     agent.load_history(conversation)
     console.print(
         f"[green]✅ 已恢复会话 {store.session_id}[/green]\n"
-        f"[dim]已加载 {len(conversation)} 条对话消息。Transcript: {store.path}[/dim]\n"
+        f"[dim]已加载 {len(conversation)} 条对话消息。Transcript: {store.path}[/dim]"
     )
+    _print_conversation_history(conversation)
     return store
 
 
@@ -390,65 +618,6 @@ def _cmd_plugins(config: RuneConfig, registry: ToolRegistry) -> None:
             console.print("[dim]无效输入，请输入 e/d <序号> 或 r 或 0。[/dim]\n")
 
 
-def _cmd_reminder() -> None:
-    """Interactive reminder management menu."""
-    store = ReminderStore()
-    while True:
-        console.print(Panel(store.get_display_text(), title=f"📝 备忘录 ({store.count()} 条)", border_style="yellow"))
-        console.print("[bold]操作:[/bold]")
-        console.print("  a        — 添加备忘录")
-        console.print("  d <序号>  — 删除备忘录（序号从 1 开始）")
-        console.print("  e <序号>  — 编辑备忘录")
-        console.print("  0        — 返回")
-        console.print(f"  [dim]文件位置: {store.path}[/dim]")
-
-        choice = console.input("\n> ").strip()
-        if choice in ("0", ""):
-            break
-
-        if choice.lower() == "a":
-            text = console.input("输入备忘内容: ").strip()
-            if text:
-                item = store.add(text)
-                console.print(f"[green]✅ 已添加: {item['text']}[/green]\n")
-            else:
-                console.print("[dim]已取消。[/dim]\n")
-            continue
-
-        parts = choice.split(None, 1)
-        if len(parts) >= 1 and parts[0].lower() == "d":
-            if len(parts) < 2 or not parts[1].isdigit():
-                console.print("[red]请输入要删除的序号，例如: d 1[/red]\n")
-                continue
-            idx = int(parts[1]) - 1  # display is 1-based, store is 0-based
-            removed = store.remove(idx)
-            if removed:
-                console.print(f"[green]✅ 已删除: {removed['text']}[/green]\n")
-            else:
-                console.print(f"[red]无效的序号。[/red]\n")
-            continue
-
-        if len(parts) >= 1 and parts[0].lower() == "e":
-            if len(parts) < 2 or not parts[1].isdigit():
-                console.print("[red]请输入要编辑的序号，例如: e 1[/red]\n")
-                continue
-            idx = int(parts[1]) - 1
-            items = store.list_all()
-            if 0 <= idx < len(items):
-                console.print(f"  当前内容: {items[idx]['text']}")
-                new_text = console.input("  新内容: ").strip()
-                if new_text:
-                    store.edit(idx, new_text)
-                    console.print(f"[green]✅ 已更新。[/green]\n")
-                else:
-                    console.print("[dim]已取消。[/dim]\n")
-            else:
-                console.print(f"[red]无效的序号。[/red]\n")
-            continue
-
-        console.print("[dim]无效输入。[/dim]\n")
-
-
 def _cmd_config(config: RuneConfig, agent: Agent) -> None:
     """Interactive config menu — view & edit all settings.
 
@@ -487,7 +656,6 @@ def _cmd_config(config: RuneConfig, agent: Agent) -> None:
             f"[bold]🔒 安全[/bold]\n"
             f"  高危操作确认: {'是' if config.security.require_confirmation_for_red else '否'}\n"
             f"  中危操作确认: {'是' if config.security.require_confirmation_for_yellow else '否'}\n"
-            f"  AI编辑备忘录: {'是' if config.security.allow_ai_edit_reminders else '否'}\n"
             f"  权限规则数: {len(config.security.permission_rules)}"
         )
         for section in plugin_sections:
@@ -548,6 +716,52 @@ def _parse_builtin(user_input: str) -> tuple[str, str] | None:
     return None
 
 
+def _choose_start_session() -> tuple[SessionStore, list[dict]]:
+    """Ask whether to start a fresh session or resume an existing one."""
+    while True:
+        console.print("[bold]选择会话:[/bold]")
+        console.print("  1. 开启新对话")
+        console.print("  2. 加载已有对话")
+        choice = console.input("\n请输入序号 [1/2] (默认 1): ").strip() or "1"
+        console.print()
+
+        if choice == "1":
+            return SessionStore(), []
+
+        if choice == "2":
+            sessions = _show_recent_sessions(limit=10)
+            if not sessions:
+                return SessionStore(), []
+
+            selection = console.input("输入要恢复的序号（留空取消并开启新对话）: ").strip()
+            if not selection:
+                console.print("[dim]已取消恢复，开启新对话。[/dim]\n")
+                return SessionStore(), []
+            if not selection.isdigit():
+                console.print("[red]请输入有效序号。[/red]\n")
+                continue
+
+            idx = int(selection) - 1
+            if not 0 <= idx < len(sessions):
+                console.print("[red]无效的序号。[/red]\n")
+                continue
+
+            store = resume_session(sessions[idx].session_id)
+            if not store:
+                console.print("[red]恢复失败：会话不存在。[/red]\n")
+                continue
+
+            conversation = store.restore_conversation()
+            console.print(
+                f"[green]✅ 已恢复会话[/green]\n"
+                f"[dim]已加载 {len(conversation)} 条对话消息。Transcript: {store.path}[/dim]"
+            )
+            _print_conversation_history(conversation)
+            return store, conversation
+
+        console.print("[red]请输入 1 或 2。[/red]\n")
+
+
 # ---- Main loop ----
 
 def main(argv: list[str] | None = None) -> None:
@@ -557,12 +771,6 @@ def main(argv: list[str] | None = None) -> None:
         target = os.path.abspath(os.path.expanduser(args.cwd))
         os.chdir(target)
 
-    # Banner
-    console.print(Text(BANNER, style="bold cyan"))
-    console.print(f"  [bold]Natural language control for your PC[/bold]  v{__version__}")
-    console.print(f"  输入 [cyan]/help[/cyan] 查看帮助，[cyan]/exit[/cyan] 退出")
-    console.print(f"  工作目录: [bold]{os.getcwd()}[/bold]\n")
-
     # Load config
     config = RuneConfig.load()
 
@@ -570,35 +778,31 @@ def main(argv: list[str] | None = None) -> None:
     if not config.is_api_key_set:
         config = _first_run_setup(config)
 
+    # Minimal startup screen
+    console.print(Text(BANNER, style="bold cyan"))
+    console.print(f"  [bold]Rune[/bold]  v{__version__}")
+    console.print(f"  工作目录: [bold]{os.getcwd()}[/bold]")
+    console.print(f"  模型: [bold]{config.llm.model}[/bold]")
+    console.print(f"  输入 [cyan]/help[/cyan] 查看帮助，[cyan]/exit[/cyan] 退出\n")
+
     # Discover and load core tools
     registry = ToolRegistry()
-    core_loaded = registry.discover_and_load()
+    registry.discover_and_load()
     # Load enabled plugins
-    plugin_loaded = registry.load_plugins(config.plugins.enabled)
-    total_loaded = core_loaded + plugin_loaded
-    plugin_names = ", ".join(config.plugins.enabled) if config.plugins.enabled else "(无)"
-    console.print(f"  ⚡ 已加载 [bold]{total_loaded}[/bold] 个工具（系统 {core_loaded} + 插件 {plugin_loaded}）")
-    console.print(f"  🔌 启用插件: [bold]{plugin_names}[/bold]")
-    console.print(f"  🤖 模型: [bold]{config.llm.model}[/bold] @ {config.llm.base_url}")
-    console.print(f"  🔒 安全模式: 高危操作需确认={config.security.require_confirmation_for_red}")
-    console.print(f"               中危操作需确认={config.security.require_confirmation_for_yellow}")
-    console.print(f"               权限规则={len(config.security.permission_rules)}")
-    reminder_store = ReminderStore()
-    console.print(f"  📝 备忘录: [bold]{reminder_store.count()}[/bold] 条")
-    memory_store = MemoryStore()
-    existing_layers = sum(1 for layer in memory_store.layers() if layer.path.exists())
-    console.print(f"  🧠 记忆层: [bold]{existing_layers}[/bold] / {len(memory_store.layers())}")
-    skill_count = len(SkillStore().list())
-    console.print(f"  🧩 Skills: [bold]{skill_count}[/bold] 个")
-    session_store = SessionStore()
-    console.print(f"  💾 会话: [bold]{session_store.session_id}[/bold]")
-    console.print(f"       [dim]{session_store.path}[/dim]")
-    console.print()
+    registry.load_plugins(config.plugins.enabled)
+    session_store, restored_conversation = _choose_start_session()
 
     # Init agent
     security = SecurityManager(config)
     agent = Agent(config, registry, security, session_store=session_store)
-    prompt_session = PromptSession(message=[("class:prompt", "You > ")])
+    if restored_conversation:
+        agent.load_history(restored_conversation)
+    prompt_session = PromptSession(
+        message=[("class:prompt", "You > ")],
+        completer=merge_completers([SlashCommandCompleter(), AtFileCompleter()]),
+        complete_while_typing=True,
+        key_bindings=_build_prompt_key_bindings(),
+    )
 
     # REPL
     while True:
@@ -637,9 +841,6 @@ def main(argv: list[str] | None = None) -> None:
         if command == "compact":
             _cmd_compact(agent)
             continue
-        if command == "reminder":
-            _cmd_reminder()
-            continue
         if command == "memory":
             _cmd_memory()
             continue
@@ -666,7 +867,10 @@ def main(argv: list[str] | None = None) -> None:
         # Send to AI agent
         console.print()  # spacing
         try:
-            response = agent.chat(user_input)
+            response = agent.chat(
+                _expand_file_mentions(user_input),
+                user_display=user_input,
+            )
         except KeyboardInterrupt:
             console.print("\n[yellow]⏸ 已中断当前操作。[/yellow]\n")
             continue
